@@ -1003,6 +1003,7 @@ fn main() -> io::Result<()> {
     let idx_cond2:       Vec<usize>;
     let has_file_header: bool;           // whether to skip the first data line
     let col_idx_to_name: HashMap<usize, String>;
+    let raw_header_line: String;         // original header line for --output-mode raw
 
     match &args.no_header {
         // ── --no-header <HEADER_FILE> ──────────────────────────────────────
@@ -1034,6 +1035,11 @@ fn main() -> io::Result<()> {
                 .filter(|s| !design.sample_to_cond.contains_key(s.as_str()))
                 .map(|s| s.as_str())
                 .collect();
+            // Reconstruct the header line from the header file names for raw mode output.
+            raw_header_line = std::iter::once(feature_col.as_str())
+                .chain(sample_names.iter().map(|s| s.as_str()))
+                .collect::<Vec<_>>()
+                .join("\t");
             eprintln!("  Feature column:   '{}'", feature_col);
             eprintln!("  Samples → '{}': {} (cols {})", design.cond1, idx_cond1.len(),
                 idx_cond1.iter().map(|i| (i + 2).to_string()).collect::<Vec<_>>().join(","));
@@ -1077,6 +1083,7 @@ fn main() -> io::Result<()> {
             };
 
             let header_line = header_text.trim_end_matches(['\n', '\r']);
+            raw_header_line = header_line.to_string();
             let headers: Vec<&str> = split_fields(header_line);
             if headers.len() < 2 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData,
@@ -1173,8 +1180,10 @@ fn main() -> io::Result<()> {
         TestType::Ancova   => "t_stat(ancova)\tdf",
     };
     let adj_col = if args.bh { "\tadj_pvalue" } else { "" };
-    // In raw mode we output the original lines with no stats header.
-    if !want_raw {
+    if want_raw {
+        // In raw mode, write the original input header line verbatim.
+        writeln!(writer, "{}", raw_header_line)?;
+    } else {
         writeln!(writer,
             "{feature}\tmean_log2_{c1}\tmean_log2_{c2}\tlog2FC({c1}_over_{c2})\t{stat}\tp_value{adj}",
             feature = feature_col, c1 = design.cond1, c2 = design.cond2,
