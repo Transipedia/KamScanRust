@@ -76,6 +76,25 @@ struct Args {
     #[arg(short = 'm', long, default_value_t = 0.0)]
     min_count: f64,
 
+    /// Minimum fraction (0.0-1.0) of the evaluated samples that must have
+    /// count > --min-count for a feature to be retained.
+    /// 0.0 (default) keeps the original behaviour: skip only when ALL are low.
+    #[arg(long, default_value_t = 0.0)]
+    min_samples_pct: f64,
+
+    /// Condition name whose samples are used to evaluate --min-samples-pct.
+    /// Must match one of the two condition names in the design file.
+    /// Mutually exclusive with --filter-samples.
+    /// If neither is given, all samples from both conditions are evaluated together.
+    #[arg(long, value_name = "CONDITION", conflicts_with = "filter_samples")]
+    filter_condition: Option<String>,
+
+    /// File listing sample names (one per line) to use when evaluating --min-samples-pct.
+    /// Mutually exclusive with --filter-condition.
+    /// If neither is given, all samples from both conditions are evaluated together.
+    #[arg(long, value_name = "SAMPLE_FILE", conflicts_with = "filter_condition")]
+    filter_samples: Option<PathBuf>,
+
     /// Only report features with p-value (or adj p-value when --bh) <= this threshold
     /// [default: 0.05]
     #[arg(short = 's', long, default_value_t = 0.05)]
@@ -306,10 +325,14 @@ fn erfc_cf(x: f64) -> f64 {
 // Returns (t_stat, p_value, df) for the group coefficient β1.
 // Returns None if N < 4 (need at least 4 samples for 3 parameters + 1 df).
 
+/// # Arguments
+/// - `y`: log2-transformed counts
+/// - `grp`: group indicator (0.0 or 1.0)
+/// - `cov`: covariate (e.g., `project_id` as numeric)
 fn ancova(
-    y:   &[f64],   // log2-transformed counts, all N samples concatenated
-    grp: &[f64],   // group indicator: 0.0 or 1.0, same order as y
-    cov: &[f64],   // covariate values, same order as y
+    y:   &[f64],
+    grp: &[f64],
+    cov: &[f64],
 ) -> Option<(f64, f64, f64)> {
     let n = y.len();
     if n < 4 || grp.len() != n || cov.len() != n { return None; }
@@ -338,7 +361,6 @@ fn ancova(
 
     // Gaussian elimination with partial pivoting
     for col in 0..3 {
-        // Find pivot
         let mut max_row = col;
         let mut max_val = aug[col][col].abs();
         for row in (col + 1)..3 {
@@ -347,7 +369,7 @@ fn ancova(
                 max_row = row;
             }
         }
-        if max_val < 1e-12 { return None; } // singular or near-singular
+        if max_val < 1e-12 { return None; }
         aug.swap(col, max_row);
 
         let pivot = aug[col][col];
@@ -363,7 +385,7 @@ fn ancova(
     // β = aug[*][3]
     let beta0 = aug[0][3];
     let beta1 = aug[1][3]; // group effect
-    let beta2 = aug[2][3];
+    let beta2 = aug[2][3]; // covariate effect
 
     // Residual sum of squares
     let rss: f64 = y.iter().zip(grp.iter()).zip(cov.iter())
@@ -377,27 +399,15 @@ fn ancova(
     let mse  = rss / df;
     if mse <= 0.0 { return None; }
 
-    // Variance of β1 = MSE * (XᵀX)⁻¹[1,1]
-    // We already have (XᵀX)⁻¹ in aug (reduced row echelon form gives us
-    // the inverse implicitly). Rather than reconstruct it, we directly use
-    // the formula: var(β1) = MSE / (SS_group_adjusted)
-    // where SS_group_adjusted = Σ(gi - ĝi)² with ĝi = fitted values of
-    // group from regressing group on the covariate.
-    //
-    // This is equivalent to the Frisch-Waugh-Lovell theorem:
-    // partial out the covariate from the group indicator, then
-    // var(β1) = MSE / Σ(ẽi²) where ẽi are residuals of group ~ covariate.
-
-    // Step 1: regress group on [1, covariate] to get ẽ
-    let n_f    = n as f64;
-    let mean_c = cov.iter().sum::<f64>() / n_f;
-    let mean_g = grp.iter().sum::<f64>() / n_f;
+    // Variance of β1 = MSE / (SS_group_adjusted)
+    let mean_c = cov.iter().sum::<f64>() / (n as f64);
+    let mean_g = grp.iter().sum::<f64>() / (n as f64);
     let scc: f64 = cov.iter().map(|&c| (c - mean_c).powi(2)).sum();
     let scg: f64 = cov.iter().zip(grp.iter())
         .map(|(&c, &g)| (c - mean_c) * (g - mean_g)).sum();
 
     let (slope_gc, intercept_gc) = if scc.abs() < 1e-12 {
-        (0.0, mean_g) // covariate is constant → no partial-out needed
+        (0.0, mean_g)
     } else {
         let s = scg / scc;
         (s, mean_g - s * mean_c)
@@ -410,7 +420,7 @@ fn ancova(
         })
         .sum();
 
-    if ss_resid_g < 1e-12 { return None; } // group perfectly predicted by covariate
+    if ss_resid_g < 1e-12 { return None; }
 
     let var_beta1 = mse / ss_resid_g;
     if var_beta1 <= 0.0 { return None; }
@@ -478,17 +488,53 @@ struct Design {
 }
 
 fn parse_design(path: &PathBuf) -> io::Result<Design> {
+    // ── First pass: collect raw lines and detect covariate encoding ──────
+    // If ALL non-empty covariate values parse as f64 we use them directly.
+    // Otherwise we treat them as categorical labels and assign integer codes
+    // in order of first appearance (0, 1, 2, ...).
     let file = File::open(path)?;
     let reader = BufReader::new(file);
+    let raw_lines: Vec<String> = reader.lines()
+        .filter_map(|l| l.ok())
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    // Collect all covariate strings to decide numeric vs categorical.
+    let cov_strings: Vec<String> = raw_lines.iter()
+        .filter_map(|line| {
+            let parts = split_design_line(line);
+            if parts.len() >= 3 { Some(parts[2].trim().to_string()) } else { None }
+        })
+        .collect();
+
+    let all_numeric = cov_strings.iter().all(|s| s.parse::<f64>().is_ok());
+
+    // Build label-to-code map for categorical encoding (preserves first-seen order).
+    let mut label_to_code: std::collections::BTreeMap<String, f64> =
+        std::collections::BTreeMap::new();
+    if !all_numeric {
+        let mut code = 0.0_f64;
+        for s in &cov_strings {
+            if !label_to_code.contains_key(s) {
+                label_to_code.insert(s.clone(), code);
+                code += 1.0;
+            }
+        }
+        eprintln!("  Covariate column contains non-numeric values; encoding as integers:");
+        for (label, code) in &label_to_code {
+            eprintln!("    '{}' -> {}", label, code);
+        }
+    }
+
+    // ── Second pass: build the Design struct ──────────────────────────────
     let mut sample_to_cond:      HashMap<String, String> = HashMap::new();
     let mut sample_to_covariate: HashMap<String, f64>    = HashMap::new();
     let mut samples_ordered:     Vec<String>             = Vec::new();
     let mut conditions:          Vec<String>             = Vec::new();
 
-    for (lineno, line) in reader.lines().enumerate() {
-        let line = line?.trim().to_string();
-        if line.is_empty() { continue; }
-        let parts = split_design_line(&line);
+    for (lineno, line) in raw_lines.iter().enumerate() {
+        let parts = split_design_line(line);
         if parts.len() < 2 {
             eprintln!("Warning: design line {} has < 2 fields, skipping.", lineno + 1);
             continue;
@@ -496,17 +542,18 @@ fn parse_design(path: &PathBuf) -> io::Result<Design> {
         let sample = parts[0].trim().to_string();
         let cond   = parts[1].trim().to_string();
 
-        // Optional third column: covariate
+        // Optional third column: covariate (numeric or categorically encoded)
         if parts.len() >= 3 {
             let cov_str = parts[2].trim();
-            match cov_str.parse::<f64>() {
-                Ok(v)  => { sample_to_covariate.insert(sample.clone(), v); }
-                Err(_) => {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+            let value: f64 = if all_numeric {
+                cov_str.parse::<f64>().map_err(|_|
+                    io::Error::new(io::ErrorKind::InvalidData,
                         format!("design line {}: cannot parse covariate '{}' as a number",
-                            lineno + 1, cov_str)));
-                }
-            }
+                            lineno + 1, cov_str)))?
+            } else {
+                *label_to_code.get(cov_str).expect("label missing from encoding map")
+            };
+            sample_to_covariate.insert(sample.clone(), value);
         }
 
         if sample_to_cond.contains_key(&sample) {
@@ -649,6 +696,12 @@ struct WorkCtx {
     idx_cond2:    Vec<usize>,
     pseudo:       f64,
     min_count:    f64,
+    /// Minimum fraction of filter_idx samples that must exceed min_count.
+    /// 0.0 means require at least 1 (original behaviour).
+    min_samples_pct: f64,
+    /// Column indices used to evaluate min_samples_pct.
+    /// Empty means use all of idx_cond1 + idx_cond2.
+    filter_idx:   Vec<usize>,
     max_pvalue:   f64,
     test:         TestType,
     norm_factors: Vec<f64>,
@@ -711,9 +764,33 @@ fn process_row(
         else { c / ctx.norm_factors.get(i).copied().unwrap_or(1.0) }
     };
 
-    let all_low = ctx.idx_cond1.iter().chain(ctx.idx_cond2.iter())
-        .all(|&i| raw.get(i).copied().unwrap_or(0.0) <= ctx.min_count);
-    if all_low { return RowResult::FilteredLow; }
+    // Determine which sample indices to evaluate for the presence filter.
+    // If a specific condition was requested (filter_idx non-empty), use that;
+    // otherwise fall back to all samples from both conditions.
+    let eval_indices: &[usize] = if !ctx.filter_idx.is_empty() {
+        &ctx.filter_idx
+    } else {
+        // static lifetime trick: collect into a temporary — handled below
+        &[]
+    };
+
+    let tmp_all: Vec<usize>;
+    let eval_indices: &[usize] = if !ctx.filter_idx.is_empty() {
+        &ctx.filter_idx
+    } else {
+        tmp_all = ctx.idx_cond1.iter().chain(ctx.idx_cond2.iter()).copied().collect();
+        &tmp_all
+    };
+
+    let n_above = eval_indices.iter()
+        .filter(|&&i| raw.get(i).copied().unwrap_or(0.0) > ctx.min_count)
+        .count();
+    let required = if ctx.min_samples_pct <= 0.0 {
+        1usize   // original behaviour: keep unless ALL are low
+    } else {
+        ((ctx.min_samples_pct * eval_indices.len() as f64).ceil() as usize).max(1)
+    };
+    if n_above < required { return RowResult::FilteredLow; }
 
     buf1.clear();
     buf1.extend(ctx.idx_cond1.iter().map(|&i| (get(i) + ctx.pseudo).log2()));
@@ -1150,7 +1227,58 @@ fn main() -> io::Result<()> {
         Vec::new()
     };
 
-    // 5. Build shared worker context
+    // 5. Resolve --filter-condition / --filter-samples into column indices
+    //    for the min-samples-pct presence filter.
+    //    Empty vec means "use all samples from both conditions".
+    let filter_idx: Vec<usize> = if let Some(ref cond_name) = args.filter_condition {
+        // ── condition name given ──────────────────────────────────────────
+        if cond_name == &design.cond1 {
+            eprintln!("  min-samples-pct filter applied to condition '{}' ({} samples)",
+                cond_name, idx_cond1.len());
+            idx_cond1.clone()
+        } else if cond_name == &design.cond2 {
+            eprintln!("  min-samples-pct filter applied to condition '{}' ({} samples)",
+                cond_name, idx_cond2.len());
+            idx_cond2.clone()
+        } else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("--filter-condition '{}' does not match any condition in the design \
+                         file (known: '{}', '{}')", cond_name, design.cond1, design.cond2)));
+        }
+    } else if let Some(ref fs_path) = args.filter_samples {
+        // ── sample-name file given ────────────────────────────────────────
+        let file = File::open(fs_path).map_err(|e| io::Error::new(e.kind(),
+            format!("Cannot open --filter-samples file '{}': {}", fs_path.display(), e)))?;
+        let names: std::collections::HashSet<String> = io::BufReader::new(file)
+            .lines()
+            .filter_map(|l| l.ok())
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if names.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("--filter-samples file '{}' is empty", fs_path.display())));
+        }
+        // Map names to column indices (intersection with known sample columns).
+        let matched: Vec<usize> = col_idx_to_name.iter()
+            .filter(|(_, name)| names.contains(name.as_str()))
+            .map(|(&idx, _)| idx)
+            .collect();
+        let unrecognised: Vec<&str> = names.iter()
+            .filter(|n| !col_idx_to_name.values().any(|v| v == *n))
+            .map(|s| s.as_str()).collect();
+        if !unrecognised.is_empty() {
+            eprintln!("  Warning: --filter-samples names not found in counts columns: {:?}",
+                unrecognised);
+        }
+        eprintln!("  min-samples-pct filter applied to {} sample(s) from file",
+            matched.len());
+        matched
+    } else {
+        Vec::new()   // empty = use all samples
+    };
+
+    // 6. Build shared worker context
     // In BH pass 1, we never need raw lines (we only collect p-values).
     // In single-pass or BH pass 2, keep raw lines only when --output-mode raw.
     let want_raw = matches!(args.output_mode, OutputMode::Raw);
@@ -1160,6 +1288,8 @@ fn main() -> io::Result<()> {
         idx_cond2:      idx_cond2.clone(),
         pseudo:         args.pseudo,
         min_count:      args.min_count,
+        min_samples_pct: args.min_samples_pct,
+        filter_idx:     filter_idx.clone(),
         max_pvalue:     if args.bh { 1.0 } else { args.max_pvalue },
         test:           args.test.clone(),
         norm_factors:   norm_factors.clone(),
@@ -1239,6 +1369,8 @@ fn main() -> io::Result<()> {
         idx_cond2:      idx_cond2,
         pseudo:         args.pseudo,
         min_count:      args.min_count,
+        min_samples_pct: args.min_samples_pct,
+        filter_idx:     filter_idx,
         max_pvalue:     1.0,
         test:           args.test.clone(),
         norm_factors,
