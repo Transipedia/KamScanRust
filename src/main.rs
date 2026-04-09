@@ -332,102 +332,152 @@ fn erfc_cf(x: f64) -> f64 {
 fn ancova(
     y:   &[f64],
     grp: &[f64],
-    cov: &[f64],
+    cov: &[f64],   // encoded as 0,1,2,...
 ) -> Option<(f64, f64, f64)> {
     let n = y.len();
-    if n < 4 || grp.len() != n || cov.len() != n { return None; }
+    if n < 4 || grp.len() != n || cov.len() != n {
+        return None;
+    }
 
-    // Build XᵀX (3×3, symmetric) and Xᵀy (3×1)
-    // Columns of X: [1, group, covariate]
-    let mut xtx = [[0.0_f64; 3]; 3];
-    let mut xty = [0.0_f64; 3];
+    // number of levels
+    let n_levels = cov.iter().cloned().fold(0.0, f64::max) as usize + 1;
+
+    // number of parameters:
+    // intercept + group + (levels - 1 dummies)
+    let p = 2 + (n_levels - 1);
+
+    if n <= p {
+        return None;
+    }
+
+    // Build XᵀX and Xᵀy
+    let mut xtx = vec![vec![0.0; p]; p];
+    let mut xty = vec![0.0; p];
 
     for i in 0..n {
-        let xi = [1.0_f64, grp[i], cov[i]];
-        for r in 0..3 {
+        let mut xi = Vec::with_capacity(p);
+
+        // intercept + group
+        xi.push(1.0);
+        xi.push(grp[i]);
+
+        // dummy variables (skip baseline level 0)
+        for level in 1..n_levels {
+            xi.push(if cov[i] == level as f64 { 1.0 } else { 0.0 });
+        }
+
+        // accumulate
+        for r in 0..p {
             xty[r] += xi[r] * y[i];
-            for c in 0..3 {
+            for c in 0..p {
                 xtx[r][c] += xi[r] * xi[c];
             }
         }
     }
 
-    // Augmented matrix [XᵀX | Xᵀy] for Gaussian elimination
-    let mut aug = [[0.0_f64; 4]; 3];
-    for r in 0..3 {
-        for c in 0..3 { aug[r][c] = xtx[r][c]; }
-        aug[r][3] = xty[r];
+    // Solve (XᵀX)β = Xᵀy via Gaussian elimination
+    let mut aug = vec![vec![0.0; p + 1]; p];
+    for r in 0..p {
+        for c in 0..p {
+            aug[r][c] = xtx[r][c];
+        }
+        aug[r][p] = xty[r];
     }
 
-    // Gaussian elimination with partial pivoting
-    for col in 0..3 {
+    for col in 0..p {
         let mut max_row = col;
         let mut max_val = aug[col][col].abs();
-        for row in (col + 1)..3 {
+
+        for row in (col + 1)..p {
             if aug[row][col].abs() > max_val {
                 max_val = aug[row][col].abs();
                 max_row = row;
             }
         }
-        if max_val < 1e-12 { return None; }
+
+        if max_val < 1e-12 {
+            return None;
+        }
+
         aug.swap(col, max_row);
 
         let pivot = aug[col][col];
-        for c in col..4 { aug[col][c] /= pivot; }
+        for c in col..=p {
+            aug[col][c] /= pivot;
+        }
 
-        for row in 0..3 {
+        for row in 0..p {
             if row == col { continue; }
             let factor = aug[row][col];
-            for c in col..4 { aug[row][c] -= factor * aug[col][c]; }
+            for c in col..=p {
+                aug[row][c] -= factor * aug[col][c];
+            }
         }
     }
 
-    // β = aug[*][3]
-    let beta0 = aug[0][3];
-    let beta1 = aug[1][3]; // group effect
-    let beta2 = aug[2][3]; // covariate effect
+    // coefficients
+    let beta = aug.iter().map(|row| row[p]).collect::<Vec<_>>();
+    let beta1 = beta[1]; // group effect
 
-    // Residual sum of squares
-    let rss: f64 = y.iter().zip(grp.iter()).zip(cov.iter())
-        .map(|((&yi, &gi), &ci)| {
-            let resid = yi - beta0 - beta1 * gi - beta2 * ci;
-            resid * resid
-        })
-        .sum();
+    // compute residuals
+    let rss: f64 = (0..n).map(|i| {
+        let mut pred = beta[0] + beta[1] * grp[i];
 
-    let df   = (n as f64) - 3.0;
-    let mse  = rss / df;
-    if mse <= 0.0 { return None; }
+        for level in 1..n_levels {
+            let idx = 1 + level;
+            if cov[i] == level as f64 {
+                pred += beta[idx];
+            }
+        }
 
-    // Variance of β1 = MSE / (SS_group_adjusted)
-    let mean_c = cov.iter().sum::<f64>() / (n as f64);
-    let mean_g = grp.iter().sum::<f64>() / (n as f64);
-    let scc: f64 = cov.iter().map(|&c| (c - mean_c).powi(2)).sum();
-    let scg: f64 = cov.iter().zip(grp.iter())
-        .map(|(&c, &g)| (c - mean_c) * (g - mean_g)).sum();
+        let resid = y[i] - pred;
+        resid * resid
+    }).sum();
 
-    let (slope_gc, intercept_gc) = if scc.abs() < 1e-12 {
-        (0.0, mean_g)
-    } else {
-        let s = scg / scc;
-        (s, mean_g - s * mean_c)
-    };
+    let df = (n as f64) - (p as f64);
+    if df <= 0.0 {
+        return None;
+    }
 
-    let ss_resid_g: f64 = grp.iter().zip(cov.iter())
-        .map(|(&g, &c)| {
-            let g_hat = intercept_gc + slope_gc * c;
-            (g - g_hat).powi(2)
-        })
-        .sum();
+    let mse = rss / df;
 
-    if ss_resid_g < 1e-12 { return None; }
+    // variance of beta1 from inverse(XᵀX)
+    // crude way: recompute column of inverse via solving unit vector
+    let mut e = vec![0.0; p];
+    e[1] = 1.0;
 
-    let var_beta1 = mse / ss_resid_g;
-    if var_beta1 <= 0.0 { return None; }
+    let mut aug2 = xtx.clone();
+    for i in 0..p {
+        aug2[i].push(e[i]);
+    }
+
+    // solve for inverse column
+    for col in 0..p {
+        let pivot = aug2[col][col];
+        if pivot.abs() < 1e-12 {
+            return None;
+        }
+        for c in col..=p {
+            aug2[col][c] /= pivot;
+        }
+        for row in 0..p {
+            if row == col { continue; }
+            let factor = aug2[row][col];
+            for c in col..=p {
+                aug2[row][c] -= factor * aug2[col][c];
+            }
+        }
+    }
+
+    let var_beta1 = mse * aug2[1][p];
+    if var_beta1 <= 0.0 {
+        return None;
+    }
 
     let t = beta1 / var_beta1.sqrt();
-    let p = two_tailed_t_pvalue(t, df);
-    Some((t, p, df))
+    let pval = two_tailed_t_pvalue(t, df);
+
+    Some((t, pval, df))
 }
 
 // ─── Benjamini-Hochberg correction ────────────────────────────────────────────
